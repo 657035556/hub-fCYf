@@ -1,113 +1,237 @@
-# week04 数据准备说明
+# 字符级 Transformer 语言模型
 
-对 `data/corpus_general.txt` 完成三件事：加终止符、切分训练/测试集、构建词表。
-流水线脚本可一键复现：
+从零实现的 Transformer Decoder，在中文问答语料上训练字符级自回归语言模型。支持训练 / 早停 / checkpoint 保存 / 续写 / 通顺度判断。
+
+---
+
+## 目录结构
+
+```
+week04/
+├── config/
+│   └── config.yaml              # 模型结构 + 训练超参
+├── data/
+│   ├── corpus_general.txt       # 原始语料（每行一条独立文本）
+│   ├── train.txt                # 训练集（加了 <eos>）
+│   ├── test.txt                 # 测试集
+│   ├── vocab.txt                # 字符级词表（5262 个 token）
+│   └── stats.json               # 数据统计信息
+├── code/
+│   ├── tokenizer.py             # CharTokenizer：字符级编解码
+│   ├── transformer_block.py     # 单层 Transformer Block（MHA + FFN）
+│   ├── my_module.py             # 完整 Decoder：Embedding → N×Block → Linear
+│   ├── train.py                 # 训练入口（含 evaluate / 早停 / best 保存）
+│   ├── demo.py                  # 推理入口（续写 / perplexity / 交互模式）
+│   └── util/
+│       ├── dataset.py           # MyDataset：拼接长序列 → 固定长度切块
+│       ├── prepare_data.py      # 数据准备脚本（语料 → train/test/vocab）
+│       └── verify_data.py       # 数据校验脚本
+├── checkpoints/
+│   └── best.pt                  # 训练产物（模型权重 + 优化器 + 配置）
+└── README.md
+```
+
+---
+
+## 模型架构
+
+纯 Decoder Transformer，因果 Mask，自回归 next-token prediction：
+
+```
+输入 id 序列 (B, T)
+        │
+        ▼
+Token Embedding + Position Embedding + Dropout
+        │
+        ▼
+  × N 层 Transformer Block:
+      ├── Multi-Head Self-Attention (causal mask)
+      │     └── QKV → split heads → scale-dot → causal mask → softmax → concat → Linear
+      ├── Add & Norm
+      ├── FFN: Linear → GELU → Linear
+      └── Add & Norm
+        │
+        ▼
+Linear → (B, T, vocab_size)   # 每个位置对所有词的 logits
+```
+
+当前配置（`config.yaml`）：
+
+| 超参 | 值 |
+|------|----|
+| model_size | 128 |
+| num_heads | 8 |
+| num_layers | 6 |
+| d_ff | 512 |
+| dropout | 0.1 |
+| max_len | 128 |
+| vocab_size | 5262 |
+
+---
+
+## 数据管线
+
+### 原始 → 训练产物
+
+```
+corpus_general.txt (395,286 行, 562 万字符)
+        │ prepare_data.py
+        ▼
+train.txt / test.txt     每行加 <eos>，按 9:1 切分
+vocab.txt                训练集字符频次统计，前 4 行为 <pad> <unk> <bos> <eos>
+stats.json               统计信息
+```
+
+### Dataset 切块方式
+
+```
+所有行编码后拼接成一条长 token 序列
+        │
+        ▼
+按 max_len + 1 不重叠切块 (stride = 129)
+        │
+        ▼
+每块 → (x, y)，其中 x = block[:-1], y = block[1:]   ← y 是 x 右移一位
+```
+
+训练集 5,419,462 token → **42,011 个样本**；测试集 602,184 token → **4,668 个样本**。
+
+---
+
+## 训练
+
+### 启动训练
 
 ```bash
-python util/prepare_data.py     # 生成 train.txt / test.txt / vocab.txt / stats.json
-python code/verify_data.py      # 校验产物（行数、终止符、词表、OOV、编解码往返）
+python code/train.py
 ```
 
-## 1. 产物
+### 训练特性
 
-| 文件 | 说明 |
-| --- | --- |
-| `data/corpus_general.txt` | 原始语料，395,286 行，UTF-8（带 BOM） |
-| `data/train.txt` | 训练集，每行末尾一个 `<eos>` |
-| `data/test.txt` | 测试集，每行末尾一个 `<eos>` |
-| `data/vocab.txt` | 字符级词表，每行一个 token，**行号即 token id** |
-| `data/stats.json` | 行数、字数、token 数、OOV 率等统计 |
-| `code/tokenizer.py` | 字符级分词器 `CharTokenizer`（训练/加载/编码/解码） |
-| `code/util` | 数据准备脚本（可配置比例、种子、最小频次、去重） |
-| `code/verify_data.py` | 数据校验脚本 |
+| 特性 | 说明 |
+|------|------|
+| 设备自动选择 | 有 CUDA 走 GPU，否则 CPU |
+| 固定随机种子 | random / numpy / torch / cuda 全设置 |
+| 梯度裁剪 | `clip_grad_norm_` 1.0 |
+| DataLoader | `shuffle=True`（train）/ `pin_memory=True` |
+| 早停 | `early_stop_patience` 个 epoch test loss 不下降就停 |
+| Best 保存 | 每次刷新 test loss 就存 `checkpoints/best.pt` |
+| 定期日志 | 每 100 step 打印一次 avg loss |
+| 每 epoch 评估 | train loss + test loss + perplexity |
 
-## 2. 处理决策
+### 早停配置（config.yaml）
 
-**终止符加在哪。** 语料每行是一条独立文本（一句提问、一次发言或一条新闻），
-因此终止符加在**每行末尾**：`问题？<eos>`。这样一行就是一个完整样本，
-训练时模型学到“`<eos>` = 文本结束”，推理时以它作为停止条件。
-语料没有句子级空行，无需额外处理；原始行内不会出现 `<eos>` 字面量（脚本会检查并拒绝）。
-未加 `<bos>`：因果语言模型以 `<eos>` 分界即可，`<bos>` 仅作为保留 token。
+```yaml
+hparams:
+  epochs: 100
+  early_stop_patience: 10     # 设为 0 或负数则关闭早停
+```
 
-**怎么切分。** 先按行随机打乱（`seed=42`），再按 9:1 切分，训练集 355,757 行、
-测试集 39,529 行。切分作用在**加 `<eos>` 之前**的原始行上，因此两边都只多一个结尾符号。
-换用其它比例/种子：`python util/prepare_data.py --train-ratio 0.95 --seed 123`。
+### 训练输出示例
 
-**词表怎么建。** 字符级（中文按字切分最自然，词表小、无 OOV 词问题）。
-只统计**训练集**字符频次，避免测试集信息泄漏；`min_freq=1` 保留训练集中出现的全部字符。
-特殊 token 固定占前 4 位，其余按频次降序排列（同频按字符编码升序，保证可复现）：
+```
+训练开始 | device=cuda | 每 epoch 657 步 | early_stop_patience=10
+  Epoch 1 [100/657] | step_loss 6.8418 | avg 7.5527
+  ...
+Epoch 1/100 | train 6.1799 | test 5.4514 | ppl 233.1 | 33.2s
+  ✓ 新 best，已保存到 checkpoints/best.pt
+...
+Epoch 99/100 | train 2.8912 | test 3.2259 | ppl 25.2 | 32.8s
+  ✓ 新 best，已保存到 checkpoints/best.pt
+```
 
-| id | token | 用途 |
-| --- | --- | --- |
-| 0 | `<pad>` | 批次对齐填充 |
-| 1 | `<unk>` | 未登录字（测试集出现、训练集未出现的字） |
-| 2 | `<bos>` | 保留未用 |
-| 3 | `<eos>` | 终止符，每行末尾 |
+### Checkpoint 格式
 
-编码时，文本中的 `<eos>` 等特殊 token 字面量会被识别为一个整体 id，而不是拆成字符；
-解码时默认跳过特殊 token。`train.txt` 中的行可直接 `encode` 得到含 `<eos>` 的 id 序列。
+```python
+{
+    "model":       state_dict,               # 模型权重
+    "optimizer":   state_dict,               # 优化器状态
+    "cfg":         OmegaConf.to_container(), # 配置快照
+    "epoch":       99,
+    "val_loss":    3.2259,
+}
+```
 
-## 3. 结果统计
+---
 
-| 项目 | 数值 |
-| --- | --- |
-| 原始语料 | 395,286 行 / 5,626,360 字 |
-| 训练集 | 355,757 行 / 5,063,705 字 / **5,419,462 token**（含 `<eos>`） |
-| 测试集 | 39,529 行 / 562,655 字 / **602,184 token**（含 `<eos>`） |
-| 词表大小 | 5,262（4 个特殊 token + 5,258 个字符） |
-| 测试集 OOV | 45 token / 602,184 = **0.0075%** |
-| 平均行长 | 14.23 字 |
+## 推理（demo.py）
 
-## 4. 注意：语料重复率 37.7%
+三种实际应用场景：
 
-原始语料有 149,057 行是完全重复的（占 37.7%），例如 `欢迎发表评论我要评论`。
-按行随机切分时，同一句话可能同时出现在训练集和测试集，测试指标会因此偏高。
-如需更严格的泛化评估，先去重再切分：
+### 场景 1：续写
+
+给定开头，模型自回归往后生成（采样 + temperature）。
 
 ```bash
-python util/prepare_data.py --dedup   # 246,229 行，词表 5,241，OOV 0.0166%
+python code/demo.py
 ```
 
-## 5. 在模型代码中使用
-
-```python
-import sys
-sys.path.insert(0, "code")
-from tokenizer import CharTokenizer
-
-tok = CharTokenizer.from_file("data/vocab.txt")
-ids = tok.encode("今天天气怎么样？", add_bos=True, add_eos=True)
-print(ids)                      # [2, ...字符 id..., 3]
-print(tok.decode(ids))          # 今天天气怎么样？
+```
+开头: "如何才能"  →  "如何才能赚到钱？"
+开头: "请问"      →  "请问您的这笔交易是支付宝账户是多少？"
+开头: "微信"      →  "微信聊天记录，怎么改"
 ```
 
-按行读取并编码（`train.txt` 自带 `<eos>`，不要再 `add_eos`）：
+### 场景 2：通顺度判断（Perplexity）
 
-```python
-with open("data/train.txt", encoding="utf-8") as f:
-    sequences = [tok.encode(line.rstrip("\n")) for line in f]
+Perplexity 越低，模型越觉得这句话像真的。实际可用于过滤乱码/灌水评论。
+
+```
+  5.2  ✓ 通顺  如何破解别人邮箱密码？
+  3.7  ✓ 通顺  明天天气怎么样？
+281.7  ✓ 勉强  xyzxyz 明天天气怎么样？       ← 开头 OOV，ppl 升高
+34M    ✗ 可疑  今 天 天 气 不 错              ← 空格都是 OOV
 ```
 
-按固定长度打包成训练样本（跨行连续，`<eos>` 作为分隔）：
+### 场景 3：交互式
 
-```python
-import torch
-from torch.utils.data import Dataset
-
-class LMDataset(Dataset):
-    def __init__(self, path, tokenizer, seq_len=128):
-        self.seq_len = seq_len
-        self.ids = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                self.ids.extend(tokenizer.encode(line.rstrip("\n")))
-
-    def __len__(self):
-        return max(0, (len(self.ids) - 1) // self.seq_len)
-
-    def __getitem__(self, idx):
-        start = idx * self.seq_len
-        x = self.ids[start:start + self.seq_len]
-        y = self.ids[start + 1:start + 1 + self.seq_len]
-        return torch.tensor(x), torch.tensor(y)
+```bash
+python code/demo.py --interactive
 ```
+
+手动输入开头，实时看续写结果，Ctrl+C 退出。
+
+### 换 checkpoint
+
+```bash
+python code/demo.py --ckpt checkpoints/best.pt
+```
+
+---
+
+## 完整使用流程
+
+```bash
+# 1. 准备数据（首次运行 / 语料更新后）
+python code/util/prepare_data.py
+python code/util/verify_data.py       # 可选：校验产物完整性
+
+# 2. 训练
+python code/train.py
+
+# 3. 推理
+python code/demo.py                   # 场景 1 + 2
+python code/demo.py --interactive     # 场景 3
+```
+
+---
+
+## 依赖
+
+- Python ≥ 3.10
+- PyTorch ≥ 2.0
+- OmegaConf
+- NumPy
+
+---
+
+## 最终训练指标
+
+| 指标 | 值 |
+|------|----|
+| 训练 epoch | 99 |
+| train loss | 2.89 |
+| **test loss** | **3.23** |
+| **test perplexity** | **25.2** |
+| OOV rate | 0.0075% |
+| vocab size | 5,262 |
